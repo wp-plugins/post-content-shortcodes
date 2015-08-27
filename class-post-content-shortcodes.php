@@ -1,7 +1,7 @@
 <?php
 /**
  * The class setup for post-content-shortcodes plugin
- * @version 0.5
+ * @version 1.0
  */
 if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 	/**
@@ -33,12 +33,47 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 			$this->current_blog_id = $blog_id;
 			$this->current_post_id = is_singular() ? get_the_ID() : false;
 			
+			$this->_setup_defaults();
+			
 			/**
-			 * Set up the default values for our shortcode attributes
-			 * These attributes are used for both shortcodes
-			 * @uses apply_filters() to allow filtering the list with the post-content-shortcodes-defaults filter
+			 * Register the two shortcodes
 			 */
-			$this->defaults = apply_filters( 'post-content-shortcodes-defaults', array(
+			add_shortcode( 'post-content', array( &$this, 'post_content' ) );
+			add_shortcode( 'post-list', array( &$this, 'post_list' ) );
+			/**
+			 * Register a shortcode to be used by Views, since the featured image 
+			 * 		doesn't work properly through Views
+			 */
+			add_shortcode( 'pcs-thumbnail', array( &$this, 'do_post_thumbnail' ) );
+			add_shortcode( 'pcs-post-url', array( &$this, 'do_post_permalink' ) );
+			add_shortcode( 'pcs-entry-classes', array( &$this, 'do_entry_classes' ) );
+			
+			/**
+			 * Prepare to register the two widgets
+			 */
+			add_action( 'widgets_init', array( $this, 'register_widgets' ) );
+			/**
+			 * Prepare to register the default stylesheet
+			 */
+			add_action( 'wp_print_styles', array( &$this, 'print_styles' ) );
+			
+			/**
+			 * Set up the various admin options items
+			 */
+			add_action( 'admin_init', array( &$this, 'admin_init' ) );
+			
+			if( $this->is_plugin_active_for_network() )
+				add_action( 'network_admin_menu', array( &$this, 'admin_menu' ) );
+			add_action( 'admin_menu', array( &$this, 'admin_menu' ) );
+		}
+		
+		/**
+		 * Set up the default values for our shortcode attributes
+		 * These attributes are used for both shortcodes
+		 * @uses apply_filters() to allow filtering the list with the post-content-shortcodes-defaults filter
+		 */
+		function _setup_defaults() {
+			$args = array(
 				'id'			=> 0,
 				'post_type'		=> 'post',
 				'order'			=> 'asc',
@@ -90,30 +125,21 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 				/* Added 0.3.4 */
 				// A post slug that can be used in place of the post ID
 				'post_name' => null, 
-			) );
-			
+				/* Added 0.6 */
+				// A taxonomy name to limit content by
+				'tax_name' => null, 
+				// A list of taxonomy term slugs or IDs to limit content by
+				'tax_term' => null, 
+			);
 			/**
-			 * Register the two shortcodes
+			 * If this site is using the WP Views plugin, add support for a 
+			 * 		completely custom layout using a Views Content Template
+			 * @since 0.6
 			 */
-			add_shortcode( 'post-content', array( &$this, 'post_content' ) );
-			add_shortcode( 'post-list', array( &$this, 'post_list' ) );
-			/**
-			 * Prepare to register the two widgets
-			 */
-			add_action( 'widgets_init', array( $this, 'register_widgets' ) );
-			/**
-			 * Prepare to register the default stylesheet
-			 */
-			add_action( 'wp_print_styles', array( &$this, 'print_styles' ) );
-			
-			/**
-			 * Set up the various admin options items
-			 */
-			add_action( 'admin_init', array( &$this, 'admin_init' ) );
-			
-			if( $this->is_plugin_active_for_network() )
-				add_action( 'network_admin_menu', array( &$this, 'admin_menu' ) );
-			add_action( 'admin_menu', array( &$this, 'admin_menu' ) );
+			if ( class_exists( 'WP_Views_plugin' ) ) {
+				$args['view_template'] = null;
+			}
+			$this->defaults = apply_filters( 'post-content-shortcodes-defaults', $args );
 		}
 		
 		/**
@@ -319,7 +345,9 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 		 */
 		function post_content( $atts=array() ) {
 			global $wpdb;
-			extract( $this->_get_attributes( $atts ) );
+			$this->shortcode_atts = $this->_get_attributes( $atts );
+			
+			extract( $this->shortcode_atts );
 			/**
 			 * Attempt to avoid an endless loop
 			 */
@@ -335,6 +363,14 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 			$p = $this->get_post_from_blog( $id, $blog_id );
 			if( empty( $p ) || is_wp_error( $p ) )
 				return apply_filters( 'post-content-shortcodes-no-posts-error', '<p>No posts could be found that matched the specified criteria.</p>', $this->get_args( $atts ) );
+			
+			/**
+			 * If Views is active, and the user has chosen to use a Content Template, 
+			 * 		render that instead of the default layout
+			 */
+			if ( array_key_exists( 'view_template', $this->shortcode_atts ) && ! empty( $this->shortcode_atts['view_template'] ) ) {
+				return $this->do_view_template( $p );
+			}
 			
 			$post_date = mysql2date( get_option( 'date_format' ), $p->post_date );
 			$post_author = get_userdata( $p->post_author );
@@ -398,6 +434,25 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 		}
 		
 		/**
+		 * Output the post content using a specified Content Template
+		 * @param $p object the Post object
+		 * @since 0.6
+		 */
+		function do_view_template( $p=null ) {
+			if ( empty( $p ) )
+				return;
+			
+			global $post;
+			setup_postdata( $p );
+			
+			$rt = render_view_template( $this->shortcode_atts['view_template'], $p );
+			
+			wp_reset_postdata();
+			
+			return $rt;
+		}
+		
+		/**
 		 * Handle the shortcode to display a list of posts
 		 * @param array $atts the array of shortcode attributes
 		 * @uses shortcode_atts() to parse the default/allowed attributes
@@ -449,9 +504,39 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 			
 			$atts = $this->_get_attributes( $atts );
 			$atts['posts_per_page'] = $atts['numberposts'];
+			$this->shortcode_atts = $atts;
 			
 			$args = array_diff_key( $args, $atts );
 			$atts['tax_query'] = array();
+			
+			if ( isset( $atts['tax_term'] ) && ! empty( $atts['tax_term'] ) && isset( $atts['tax_name'] ) && ! empty( $atts['tax_name'] ) ) {
+				$terms = explode( ' ', $atts['tax_term'] );
+				if ( count( $terms ) > 0 ) {
+					if ( 'tag' == $atts['tax_name'] ) {
+						if ( is_numeric( $terms[0] ) ) {
+							$atts['tag__in'] = $terms;
+						} else {
+							$atts['tag_slug__in'] = $terms;
+						}
+					} else if ( 'category' == $atts['tax_name'] ) {
+						if ( is_numeric( $terms[0] ) ) {
+							$atts['cat'] = implode( ',', $terms );
+						} else {
+							$atts['category_name'] = implode( ',', $terms );
+						}
+					} else {
+						if ( is_numeric( $terms[0] ) ) {
+							$field = 'id';
+							$terms = array_map( 'absint', $terms );
+						} else {
+							$field = 'slug';
+						}
+							
+						$atts['tax_query'][] = array( 'taxonomy' => $atts['tax_term'], 'field' => $field, 'terms' => $terms );
+					}
+				}
+			}
+			
 			foreach ( $args as $k => $v ) {
 				if ( is_numeric( $v ) )
 					$atts['tax_query'][] = array( 'taxonomy' => $k, 'field' => 'id', 'terms' => intval( $v ) );
@@ -475,6 +560,26 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 			$posts = $this->get_posts_from_blog( $atts, $atts['blog_id'] );
 			if( empty( $posts ) )
 				return apply_filters( 'post-content-shortcodes-no-posts-error', '<p>No posts could be found that matched the specified criteria.</p>', $this->get_args( $atts ) );
+			
+			/**
+			 * If the user is using the WP Views plugin and specified a Content Template 
+			 * 		to use for the results, use that instead of the default layout
+			 * @since 0.6
+			 */
+			if ( array_key_exists( 'view_template', $this->shortcode_atts ) && ! empty( $this->shortcode_atts['view_template'] ) ) {
+				$output = apply_filters( 'post-content-shortcodes-views-template-opening', '<div class="post-list">' );
+				add_filter( 'post_thumbnail_html', array( $this, 'do_post_thumbnail' ), 99 );
+				add_filter( 'post_link', array( $this, 'do_post_permalink' ), 99 );
+				$this->shortcode_atts['post_number'] = 1;
+				foreach ( $posts as $p ) {
+					$output .= $this->do_view_template( $p );
+					$this->shortcode_atts['post_number']++;
+				}
+				remove_filter( 'post_thumbnail_html', array( $this->do_post_thumbnail() ), 99 );
+				remove_filter( 'post_link', array( $this, 'do_post_permalink' ), 99 );
+				$output .= apply_filters( 'post-content-shortcodes-views-template-closing', '</div>' );
+				return $output;
+			}
 			
 			$output = apply_filters( 'post-content-shortcodes-open-list', '<ul class="post-list' . ( $atts['show_excerpt'] ? ' with-excerpt' : '' ) . ( $atts['show_image'] ? ' with-image' : '' ) . '">', $atts );
 			foreach( $posts as $p ) {
@@ -679,13 +784,13 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 				return $posts;
 			}
 			
+			$args['cache_results'] = false;
+			
 			if ( isset( $_GET['delete_transients'] ) )
 				delete_transient( 'pcsc-list-blog' . $blog_id . '-args' . md5( maybe_serialize( $args ) ) );
 			
 			if( false !== ( $p = get_transient( 'pcsc-list-blog' . $blog_id . '-args' . md5( maybe_serialize( $args ) ) ) ) )
 				return $p;
-			
-			$args['cache_results'] = false;
 			
 			$org_blog = switch_to_blog( $blog_id );
 			$this->check_taxonomies( $args['tax_query'], $atts['post_type'] );
@@ -697,7 +802,10 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 						$posts[$key]->post_thumbnail = get_the_post_thumbnail( $p->ID, $image_size, array( 'class' => apply_filters( 'post-content-shortcodes-image-class', 'pcs-featured-image', $posts[$key], $this->shortcode_atts ) ) );
 					else
 						$posts[$key]->post_thumbnail = '';
-						
+				}
+			}
+			if ( false !== $this->shortcode_atts['show_comments'] ) {
+				foreach ( $posts as $key => $p ) {
 					$posts[$key]->post_comments = $this->do_comments( $p );
 				}
 			}
@@ -853,7 +961,7 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 			
 			$atts['orderby'] = str_replace( 'post_', '', $atts['orderby'] );
 			
-			unset( $atts['blog_id'], $atts['exclude_current'] );
+			unset( $atts['blog_id'], $atts['exclude_current'], $atts['tax_name'], $atts['tax_term'], $atts['view_template'], $atts['show_image'], $atts['image_width'], $atts['image_height'] );
 			
 			/**
 			 * Output a little debug info if necessary
@@ -862,6 +970,36 @@ if( !class_exists( 'Post_Content_Shortcodes' ) ) {
 				error_log( '[PCS Debug]: Preparing to return filtered args: ' . print_r( $atts, true ) );
 			
 			return array_filter( $atts );
+		}
+		
+		function do_post_thumbnail( $html=null ) {
+			if ( $GLOBALS['blog_id'] == $this->shortcode_atts['blog_id'] && ! empty( $html ) )
+				return $html;
+			
+			return $GLOBALS['post']->post_thumbnail;
+		}
+		
+		function do_post_permalink( $link ) {
+			if ( $GLOBALS['blog_id'] == $this->shortcode_atts['blog_id'] && ! empty( $link ) )
+				return $link;
+			
+			return $this->get_shortlink_from_blog( $GLOBALS['post']->ID, $this->shortcode_atts['blog_id'] );
+		}
+		
+		function do_entry_classes( $atts=array() ) {
+			$atts = shortcode_atts( array( 'classes' => '', 'columns' => 0 ), $atts );
+			$classes = explode( ' ', $atts['classes'] );
+			if ( is_numeric( $atts['columns'] ) && $atts['columns'] > 0 ) {
+				$col = $this->shortcode_atts['post_number'] % $atts['columns'];
+				
+				if ( 1 == $col ) {
+					$classes[] = 'first';
+				}
+				
+				$classes[] = $col > 0 ? sprintf( 'column-%d', $col ) : sprintf( 'column-%d', $atts['columns'] );
+			}
+			
+			return implode( ' ', $classes );
 		}
 	}
 }
